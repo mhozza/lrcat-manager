@@ -1,5 +1,12 @@
 package com.mhozza
 
+import com.github.ajalt.clikt.core.CliktCommand
+import com.github.ajalt.clikt.parameters.arguments.argument
+import com.github.ajalt.clikt.parameters.options.multiple
+import com.github.ajalt.clikt.parameters.options.option
+import com.github.ajalt.clikt.parameters.options.pair
+import com.github.ajalt.clikt.parameters.types.path
+import mu.KotlinLogging
 import java.nio.file.Path
 import java.sql.Connection
 import java.sql.DriverManager
@@ -7,9 +14,7 @@ import java.sql.ResultSet
 import java.sql.SQLException
 import kotlin.math.max
 
-val WINDOWS_LINUX_DISK_MAPPING = mapOf(
-    "E:" to "/media/dataX"
-)
+private val logger = KotlinLogging.logger {}
 
 fun Connection.sql(sql: String, onResult: ResultSet.() -> Unit) {
     val stmt = createStatement()
@@ -20,9 +25,8 @@ fun Connection.sql(sql: String, onResult: ResultSet.() -> Unit) {
     }
 }
 
-fun String.maybeConvertToLinuxPath(): String {
-    // TODO disable mapping with fag or use config.
-    for (mapping in WINDOWS_LINUX_DISK_MAPPING) {
+fun String.mapDirectories(directoryMapping: Map<String, String>): String {
+    for (mapping in directoryMapping) {
         if (this.startsWith(mapping.key)) {
             return this.replaceFirst(mapping.key, mapping.value)
         }
@@ -31,12 +35,12 @@ fun String.maybeConvertToLinuxPath(): String {
     return this
 }
 
-fun Connection.getRootFolders(): Map<Int, Path> {
+fun Connection.getRootFolders(directoryMapping: Map<String, String>): Map<Int, Path> {
     val sql = "SELECT id_local, absolutePath FROM AgLibraryRootFolder"
 
     return buildMap {
         sql(sql) {
-            val path = Path.of(getString("absolutePath").maybeConvertToLinuxPath())
+            val path = Path.of(getString("absolutePath").mapDirectories(directoryMapping))
             put(getInt("id_local"), path)
         }
     }
@@ -76,7 +80,7 @@ data class PhotoMetadata(val picked: Picked, val rating: Int?) {
                 picked == Picked.UNPICKED || other.picked == Picked.UNPICKED -> Picked.UNPICKED
                 else -> Picked.REJECTED
             },
-            if (rating == null && other.rating == null) null else max(rating ?: 0 , other.rating ?: 0)
+            if (rating == null && other.rating == null) null else max(rating ?: 0, other.rating ?: 0)
         )
     }
 
@@ -124,31 +128,41 @@ fun Connection.getPhotos(folders: Map<Int, Path>, metadata: Map<Int, PhotoMetada
     }
 }
 
-fun connect() {
+fun withSqlite3Db(path: Path, block: Connection.() -> Unit) {
     var conn: Connection? = null
     try {
-        val url = "jdbc:sqlite:/home/mio/t/2024.lrcat.db"
+        val url = "jdbc:sqlite:$path"
         conn = DriverManager.getConnection(url)
-        println("Connection to SQLite has been established.")
-
-        val rootFolders = conn.getRootFolders()
-        val folders = conn.getFolders(rootFolders)
-        val metadata = conn.getPhotosMetadata()
-        val photos = conn.getPhotos(folders, metadata)
-        for (unpickedPhoto in photos.filter { it.metadata.picked != Picked.PICKED && it.metadata.rating == null }) {
-            println(unpickedPhoto.path)
-        }
+        logger.info { "Connection to SQLite has been established." }
+        conn.block()
     } catch (e: SQLException) {
-        println(e.message)
+        logger.error { e.message }
     } finally {
         try {
             conn?.close()
         } catch (ex: SQLException) {
-            println(ex.message)
+            logger.error { ex.message }
         }
     }
 }
 
-fun main() {
-    connect()
+class LrcatManager : CliktCommand() {
+    private val path: Path by argument().path(mustExist = true, mustBeReadable = true, canBeDir = false)
+    private val directoryMapping: List<Pair<String, String>> by option("-m", "--durectory-mapping").pair().multiple()
+
+    override fun run() {
+        withSqlite3Db(path) {
+            val rootFolders = getRootFolders(directoryMapping.toMap())
+            val folders = getFolders(rootFolders)
+            val metadata = getPhotosMetadata()
+            val photos = getPhotos(folders, metadata)
+            for (unpickedPhoto in photos.filter { it.metadata.picked != Picked.PICKED && it.metadata.rating == null }) {
+                println(unpickedPhoto.path)
+            }
+        }
+    }
+}
+
+fun main(args: Array<String>) {
+    LrcatManager().main(args)
 }
